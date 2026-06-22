@@ -1281,9 +1281,12 @@ fn perform_absolute_layout_on_absolute_children(
                 // the 'direction' property of the containing block is 'rtl') or 'right' (in case 'direction' is 'ltr') and solve for that value.
                 width: {
                     let auto_margin_count = margin.left.is_none() as u8 + margin.right.is_none() as u8;
-                    if auto_margin_count == 2
-                        && (style_size.width.is_none() || style_size.width.unwrap() >= free_space.width)
-                    {
+                    // When both margins are auto and there is positive free space, split it
+                    // equally to center the box (CSS abspos rule). Only collapse to 0 when the
+                    // size is auto or there is no free space. The previous `style_size >=
+                    // free_space` check wrongly collapsed centering whenever the box was larger
+                    // than half the containing block on that axis.
+                    if auto_margin_count == 2 && (style_size.width.is_none() || free_space.width <= 0.0) {
                         0.0
                     } else if auto_margin_count > 0 {
                         free_space.width / auto_margin_count as f32
@@ -1293,9 +1296,9 @@ fn perform_absolute_layout_on_absolute_children(
                 },
                 height: {
                     let auto_margin_count = margin.top.is_none() as u8 + margin.bottom.is_none() as u8;
-                    if auto_margin_count == 2
-                        && (style_size.height.is_none() || style_size.height.unwrap() >= free_space.height)
-                    {
+                    // See the width branch above — split positive free space to center
+                    // vertically; only collapse to 0 when size is auto or there is no free space.
+                    if auto_margin_count == 2 && (style_size.height.is_none() || free_space.height <= 0.0) {
                         0.0
                     } else if auto_margin_count > 0 {
                         free_space.height / auto_margin_count as f32
