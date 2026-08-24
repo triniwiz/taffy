@@ -1352,7 +1352,16 @@ fn determine_container_main_size(
                 let main_axis_gap = constants.gap.main(constants.dir);
                 let item_main_length = |child: &FlexItem| {
                     let padding_border_sum = (child.padding + child.border).main_axis_sum(constants.dir);
-                    (child.flex_basis.maybe_max(child.min_size.main(constants.dir))
+                    // Clamp the flex basis to the item's min/max main size before adding margin,
+                    // mirroring the content-contribution formula used by the sibling
+                    // MinContent/MaxContent branch below. Without the `.maybe_min(max_size)` here,
+                    // a definite max-size never constrains the container's shrink-to-fit main size
+                    // (see DioxusLabs/taffy upstream gap: max_size is dropped in this Definite
+                    // branch even though it's honoured in the MinContent/MaxContent branch).
+                    (child
+                        .flex_basis
+                        .maybe_max(child.min_size.main(constants.dir))
+                        .maybe_min(child.max_size.main(constants.dir))
                         + child.margin.main_axis_sum(constants.dir))
                     .max(padding_border_sum)
                 };
