@@ -1282,10 +1282,16 @@ fn determine_container_main_size(
                     // a definite max-size never constrains the container's shrink-to-fit main size
                     // (see DioxusLabs/taffy upstream gap: max_size is dropped in this Definite
                     // branch even though it's honoured in the MinContent/MaxContent branch).
+                    //
+                    // Order matters: apply max_size BEFORE min_size, so that when they conflict
+                    // (min_size > max_size — a legal CSS state) min_size wins, per the standard
+                    // CSS clamp `used = max(min, min(specified, max))`. Clamping the other way
+                    // round regressed `min_width_overrides_max_width` (min-width:100/max-width:50
+                    // must resolve to 100, not 50).
                     (child
                         .flex_basis
-                        .maybe_max(child.min_size.main(constants.dir))
                         .maybe_min(child.max_size.main(constants.dir))
+                        .maybe_max(child.min_size.main(constants.dir))
                         + child.margin.main_axis_sum(constants.dir))
                     .max(padding_border_sum)
                 };
