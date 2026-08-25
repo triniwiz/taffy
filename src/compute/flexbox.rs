@@ -1274,27 +1274,15 @@ fn determine_container_main_size(
         match available_space.main(dir) {
             AvailableSpace::Definite(main_axis_available_space) => {
                 let main_axis_gap = constants.gap.main(constants.dir);
-                let item_main_length = |child: &FlexItem| {
-                    let padding_border_sum = (child.padding + child.border).main_axis_sum(constants.dir);
-                    // Clamp the flex basis to the item's min/max main size before adding margin,
-                    // mirroring the content-contribution formula used by the sibling
-                    // MinContent/MaxContent branch below. Without the `.maybe_min(max_size)` here,
-                    // a definite max-size never constrains the container's shrink-to-fit main size
-                    // (see DioxusLabs/taffy upstream gap: max_size is dropped in this Definite
-                    // branch even though it's honoured in the MinContent/MaxContent branch).
-                    //
-                    // Order matters: apply max_size BEFORE min_size, so that when they conflict
-                    // (min_size > max_size — a legal CSS state) min_size wins, per the standard
-                    // CSS clamp `used = max(min, min(specified, max))`. Clamping the other way
-                    // round regressed `min_width_overrides_max_width` (min-width:100/max-width:50
-                    // must resolve to 100, not 50).
-                    (child
-                        .flex_basis
-                        .maybe_min(child.max_size.main(constants.dir))
-                        .maybe_max(child.min_size.main(constants.dir))
-                        + child.margin.main_axis_sum(constants.dir))
-                    .max(padding_border_sum)
-                };
+                // Use the item's already-computed hypothetical outer size (set in
+                // determine_flex_base_size) rather than re-deriving flex_basis.clamp(min,max)
+                // here — the hypothetical size already floors by the item's automatic
+                // minimum content size (min-content, when min-size is auto) as well as its
+                // own min/max, matching the MinContent/MaxContent branch below. Re-deriving
+                // from flex_basis alone dropped both the automatic minimum size and (in an
+                // earlier version of this branch) max_size entirely.
+                let item_main_length =
+                    |child: &FlexItem| child.hypothetical_outer_size.main(constants.dir);
                 let longest_line_length: f32 = lines
                     .iter()
                     .map(|line| {
