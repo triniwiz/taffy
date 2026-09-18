@@ -11,11 +11,12 @@ use crate::style::{AvailableSpace, ContainingBlockClaims, CoreStyle};
 #[cfg(feature = "grid")]
 use crate::tree::DetailedLayoutInfo;
 use crate::tree::{
-    Layout, LayoutContainingBlock, LayoutOutput, LayoutPartialTreeExt, NodeId, OofCandidate, OofCandidates,
-    OofPositioningArea, SizingMode,
+    Layout, LayoutContainingBlock, LayoutInput, LayoutOutput, LayoutPartialTreeExt, NodeId, OofCandidate,
+    OofCandidates, OofPositioningArea, RequestedAxis, RunMode, SizingMode,
 };
 use crate::util::sys::{f32_max, Vec};
 use crate::util::{MaybeMath, MaybeResolve, ResolveOrZero};
+use crate::geometry::AbsoluteAxis;
 use crate::{AxisStaticEdge, BoxSizing, Direction};
 
 #[cfg(feature = "content_size")]
@@ -315,6 +316,39 @@ pub(crate) fn perform_oof_layout(
             known_dimensions = known_dimensions.maybe_apply_aspect_ratio(aspect_ratio).maybe_clamp(min_size, max_size);
         }
 
+        // An axis still unknown at this point is shrink-to-fit: its size comes from the box's
+        // own content, which per CSS is *not* a definite size. The box still gets that size, but
+        // it must not serve as a percentage basis for the box's own content box (a percentage
+        // `gap`, say) -- that would be circular.
+        // An axis still unknown at this point is shrink-to-fit: its size comes from the box's
+        // own content, which per CSS is *not* a definite size. The box still gets that size, but
+        // it must not serve as a percentage basis for the box's own content box (a percentage
+        // `gap`, say) -- that would be circular.
+        let content_derived =
+            Size { width: known_dimensions.width.is_none(), height: known_dimensions.height.is_none() };
+
+        // The inline axis is shrink-to-fit: min(max-content, max(min-content, available)) per
+        // CSS 2.1 10.3.7. Measuring straight into `Definite(available)` is not the same thing --
+        // a flex item's basis resolves against that space and inflates the result past the box's
+        // max-content size. Where max-content fits the available width it *is* the shrink-to-fit
+        // size, so take it directly; otherwise fall through to the measure below, which lands on
+        // max(min-content, available).
+        if content_derived.width {
+            let avail_width = area_width.maybe_clamp(min_size.width, max_size.width);
+            let max_content_width = tree.measure_child_size(
+                candidate.node,
+                known_dimensions,
+                area_size.map(Some),
+                Size { width: AvailableSpace::MaxContent, height: AvailableSpace::MaxContent },
+                SizingMode::ContentSize,
+                AbsoluteAxis::Horizontal,
+                Line::FALSE,
+            );
+            if max_content_width <= avail_width {
+                known_dimensions.width = Some(max_content_width);
+            }
+        }
+
         let final_size = match (known_dimensions.width, known_dimensions.height) {
             (Some(width), Some(height)) => Size { width, height },
             _ => {
@@ -334,16 +368,24 @@ pub(crate) fn perform_oof_layout(
         }
         .maybe_clamp(min_size, max_size);
 
-        let mut layout_output = tree.perform_child_layout(
+        let mut layout_output = tree.compute_child_layout(
             candidate.node,
-            final_size.map(Some),
-            area_size.map(Some),
-            Size {
-                width: AvailableSpace::Definite(area_width.maybe_clamp(min_size.width, max_size.width)),
-                height: AvailableSpace::Definite(area_height.maybe_clamp(min_size.height, max_size.height)),
+            LayoutInput {
+                run_mode: RunMode::PerformLayout,
+                sizing_mode: SizingMode::ContentSize,
+                axis: RequestedAxis::Both,
+                known_dimensions: final_size.map(Some),
+                known_dimensions_are_definite: Size {
+                    width: !content_derived.width,
+                    height: !content_derived.height,
+                },
+                parent_size: area_size.map(Some),
+                available_space: Size {
+                    width: AvailableSpace::Definite(area_width.maybe_clamp(min_size.width, max_size.width)),
+                    height: AvailableSpace::Definite(area_height.maybe_clamp(min_size.height, max_size.height)),
+                },
+                vertical_margins_are_collapsible: Line::FALSE,
             },
-            SizingMode::ContentSize,
-            Line::FALSE,
         );
 
         let non_auto_margin = Rect {
