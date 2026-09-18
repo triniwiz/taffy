@@ -1407,8 +1407,36 @@ fn determine_container_main_size(
 
                 if lines.len() > 1 {
                     f32_max(size, main_axis_available_space)
-                } else {
+                } else if !constants.dir.is_row() {
+                    // Only the inline axis shrink-to-fits against the available space.
+                    // An auto block size is its content size, and is not clamped by the
+                    // space the container happens to be offered.
                     size
+                } else {
+                    // `size` above is the container's max-content size. With an
+                    // indefinite main size under definite available space this is a
+                    // shrink-to-fit sizing, which per CSS is
+                    // min(max-content, max(min-content, available)) -- so the
+                    // container may not overflow the space it was offered unless its
+                    // own min-content size does. An item that cannot shrink keeps its
+                    // whole hypothetical size in that floor.
+                    let min_content_length = |child: &FlexItem| {
+                        if child.flex_shrink == 0.0 {
+                            child.hypothetical_outer_size.main(constants.dir)
+                        } else {
+                            child.resolved_minimum_main_size + child.margin.main_axis_sum(constants.dir)
+                        }
+                    };
+                    let min_content_size: f32 = lines
+                        .iter()
+                        .map(|line| {
+                            let line_main_axis_gap = sum_axis_gaps(main_axis_gap, line.items.len());
+                            line.items.iter().map(min_content_length).sum::<f32>() + line_main_axis_gap
+                        })
+                        .max_by(|a, b| a.total_cmp(b))
+                        .unwrap_or(0.0)
+                        + main_content_box_inset;
+                    f32_min(size, f32_max(main_axis_available_space, min_content_size))
                 }
             }
             AvailableSpace::MinContent if constants.is_wrap => {
