@@ -645,7 +645,17 @@ fn compute_constants(
     let has_definite_cross_size = known_dimensions_are_definite.cross(dir) && known_dimensions.cross(dir).is_some();
     let cross_axis_available_space_is_definite =
         has_definite_cross_size || matches!(available_space.cross(dir), AvailableSpace::Definite(_));
-    let gap = style.gap().resolve_or_zero(node_inner_size.or(Size::zero()), |val, basis| tree.calc(val, basis));
+    // A percentage gap resolves against the container's own content box. Where that size is
+    // content-derived (indefinite per CSS) the resolution is cyclic; CSS resolves it against the
+    // resulting size, which for the main axis is what the re-resolve step after
+    // determine_container_main_size does. The cross axis gets no such second pass, so resolving
+    // it against a content-derived size feeds the size back into itself -- the cross size depends
+    // on the gap. Resolve that case against zero instead.
+    let mut gap_basis = node_inner_size;
+    if !known_dimensions_are_definite.cross(dir) {
+        gap_basis.set_cross(dir, None);
+    }
+    let gap = style.gap().resolve_or_zero(gap_basis.or(Size::zero()), |val, basis| tree.calc(val, basis));
 
     let container_size = Size::zero();
     let inner_container_size = Size::zero();
