@@ -4,7 +4,7 @@
 //! child's containing block). Instead they emit [`OofCandidate`] records which bubble up the tree
 //! via [`LayoutOutput::oof_candidates`](crate::LayoutOutput) until they reach the box's containing
 //! block, which lays the box out using the routine in this module.
-use crate::geometry::{Line, Point, Rect, Size};
+use crate::geometry::{AbsoluteAxis, Line, Point, Rect, Size};
 use crate::style::{
     AlignItemsKeyword, AlignSelf, AlignmentSafety, AvailableSpace, ContainingBlockClaims, CoreStyle, OofItemStyle,
     Overflow,
@@ -626,6 +626,31 @@ pub(crate) fn layout_oof_box<Tree: LayoutContainingBlock>(
         }
     }
 
+    // An axis still unknown at this point is shrink-to-fit. A content-derived block size must
+    // not serve as a percentage basis for the box's own content box (a percentage row `gap`,
+    // say); the inline size stays definite so its contents can wrap against it.
+    let content_derived = Size { width: known_dimensions.width.is_none(), height: known_dimensions.height.is_none() };
+
+    // Shrink-to-fit is min(max-content, max(min-content, available)) (CSS 2.1 10.3.7). Measuring
+    // straight into the available space lets a flex item's basis inflate the result past
+    // max-content, so take max-content directly where it fits.
+    if content_derived.width {
+        if let AvailableSpace::Definite(avail_width) = available_space.width {
+            let max_content_width = tree.measure_child_size(
+                candidate.node,
+                known_dimensions,
+                area_size.map(Some),
+                Size { width: AvailableSpace::MaxContent, height: AvailableSpace::MaxContent },
+                SizingMode::ContentSize,
+                AbsoluteAxis::Horizontal,
+                Line::FALSE,
+            );
+            if max_content_width <= avail_width {
+                known_dimensions.width = Some(max_content_width);
+            }
+        }
+    }
+
     let final_size = match (known_dimensions.width, known_dimensions.height) {
         (Some(width), Some(height)) => Size { width, height },
         _ => {
@@ -644,7 +669,7 @@ pub(crate) fn layout_oof_box<Tree: LayoutContainingBlock>(
 
     let layout_input = LayoutInput {
         known_dimensions: final_size.map(Some),
-        known_dimensions_are_definite: Size { width: true, height: true },
+        known_dimensions_are_definite: Size { width: true, height: !content_derived.height },
         parent_size: area_size.map(Some),
         available_space,
         sizing_mode: SizingMode::ContentSize,
