@@ -1467,7 +1467,9 @@ fn determine_container_main_size(
                         .max_by(|a, b| a.total_cmp(b))
                         .unwrap_or(0.0)
                         + main_content_box_inset;
-                    f32_min(size, f32_max(main_axis_available_space, min_content_size))
+                    // `size` is an outer size and the available space is inner, so add the
+                    // inset back before clamping.
+                    f32_min(size, f32_max(main_axis_available_space + main_content_box_inset, min_content_size))
                 }
             }
             AvailableSpace::MinContent if constants.is_wrap => {
@@ -1974,7 +1976,26 @@ fn determine_hypothetical_cross_size(
             _ => child_available_cross,
         };
 
-        let child_inner_cross = child_cross.unwrap_or_else(|| {
+        // A stretched item in a single-line container with a known cross size takes the
+        // line's cross size (steps 8 and 11), so measuring its hypothetical cross size is
+        // wasted work; for a flex row that work is a shrink-to-fit pass over its subtree.
+        let stretched_cross = (!constants.is_wrap
+            && child.align_self == AlignSelf::STRETCH
+            && child.size_style.cross(constants.dir).is_auto()
+            && !child.margin_is_auto.cross_start(constants.dir)
+            && !child.margin_is_auto.cross_end(constants.dir)
+            && !child.participates_in_baseline_alignment(constants.dir))
+        .then(|| {
+            constants.node_inner_size.cross(constants.dir).map(|inner| {
+                (inner - child.margin.cross_axis_sum(constants.dir))
+                    .max(0.0)
+                    .maybe_clamp(child.min_size.cross(constants.dir), child.max_size.cross(constants.dir))
+                    .max(padding_border_sum)
+            })
+        })
+        .flatten();
+
+        let child_inner_cross = child_cross.or(stretched_cross).unwrap_or_else(|| {
             tree.compute_child_layout(
                 child.node,
                 LayoutInput {
