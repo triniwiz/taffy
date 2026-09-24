@@ -1520,7 +1520,9 @@ fn determine_container_main_size(
                         .max_by(|a, b| a.total_cmp(b))
                         .unwrap_or(0.0)
                         + main_content_box_inset;
-                    f32_min(size, f32_max(main_axis_available_space, min_content_size))
+                    // `size` is an outer size and the available space is inner, so add the
+                    // inset back before clamping.
+                    f32_min(size, f32_max(main_axis_available_space + main_content_box_inset, min_content_size))
                 }
             }
             AvailableSpace::MinContent if constants.is_wrap => {
