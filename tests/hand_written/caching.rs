@@ -18,7 +18,7 @@ mod caching {
 
         taffy.compute_layout_with_measure(node, Size::MAX_CONTENT, test_measure_function).unwrap();
 
-        assert_eq!(taffy.get_node_context_mut(leaf).unwrap().count, 7);
+        assert_eq!(taffy.get_node_context_mut(leaf).unwrap().count, 6);
     }
 
     #[test]
@@ -35,7 +35,7 @@ mod caching {
         }
 
         taffy.compute_layout_with_measure(node, Size::MAX_CONTENT, test_measure_function).unwrap();
-        assert_eq!(taffy.get_node_context_mut(leaf).unwrap().count, 7);
+        assert_eq!(taffy.get_node_context_mut(leaf).unwrap().count, 6);
     }
 
     /// A node's size measured for one axis must not be returned from the cache when the other
