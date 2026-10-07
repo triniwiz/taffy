@@ -1377,12 +1377,9 @@ fn determine_container_main_size(
         match available_space.main(dir) {
             AvailableSpace::Definite(main_axis_available_space) => {
                 let main_axis_gap = constants.gap.main(constants.dir);
-                let item_main_length = |child: &FlexItem| {
-                    let padding_border_sum = (child.padding + child.border).main_axis_sum(constants.dir);
-                    (child.flex_basis.maybe_max(child.min_size.main(constants.dir))
-                        + child.margin.main_axis_sum(constants.dir))
-                    .max(padding_border_sum)
-                };
+                // The hypothetical size is already floored by the automatic minimum size and
+                // clamped to min/max, matching the MinContent/MaxContent branch below.
+                let item_main_length = |child: &FlexItem| child.hypothetical_outer_size.main(constants.dir);
                 let longest_line_length: f32 = lines
                     .iter()
                     .map(|line| {
