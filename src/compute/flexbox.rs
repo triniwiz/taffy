@@ -1168,6 +1168,9 @@ fn determine_flex_base_size(
     }
 }
 
+/// How far a line may overrun its container before an item wraps: float rounding, not overflow.
+const WRAP_TOLERANCE: f32 = 1.0 / 64.0;
+
 /// Collect flex items into flex lines.
 ///
 /// # [9.3. Main Size Determination](https://www.w3.org/TR/css-flexbox-1/#main-sizing)
@@ -1256,7 +1259,9 @@ fn collect_flex_lines<'a>(
                             // So first item in the line does not contribute a gap to the line length
                             let gap_contribution = if idx == 0 { 0.0 } else { main_axis_gap };
                             line_length += child.hypothetical_outer_size.main(constants.dir) + gap_contribution;
-                            line_length > main_axis_available_space && idx != 0
+                            // Within 1/64px counts as fitting, as in browsers' fixed-point layout:
+                            // 3 x 33.333333% sums past 100% in f32 and would wrap the third item.
+                            line_length > main_axis_available_space + WRAP_TOLERANCE && idx != 0
                         })
                         .map(|(idx, _)| idx)
                         .unwrap_or(flex_items.len());
