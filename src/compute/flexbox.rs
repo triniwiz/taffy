@@ -152,6 +152,139 @@ impl FlexItem {
     }
 }
 
+/// Spare vectors reused across flexbox passes instead of allocating per container. They are used
+/// as stacks, so nested containers each take their own.
+#[cfg(feature = "std")]
+mod scratch {
+    use super::{FlexItem, FlexLine};
+    use std::cell::RefCell;
+    use std::vec::Vec;
+
+    /// Spare vectors kept per kind; deeper nesting than this allocates as before.
+    const MAX_POOLED: usize = 64;
+
+    std::thread_local! {
+        static ITEMS: RefCell<Vec<Vec<FlexItem>>> = const { RefCell::new(Vec::new()) };
+        static LINES: RefCell<Vec<Vec<FlexLine<'static>>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Re-types an emptied vector. In-place collection keeps the allocation, since the element
+    /// types differ only in lifetime.
+    fn recycle<T, U>(mut v: Vec<T>) -> Vec<U> {
+        v.clear();
+        v.into_iter().map(|_| unreachable!()).collect()
+    }
+
+    /// Returns an emptied vector to `pool` unless it is full.
+    fn give<T>(pool: &RefCell<Vec<Vec<T>>>, v: Vec<T>) {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < MAX_POOLED {
+            pool.push(v);
+        }
+    }
+
+    /// An empty item list, reusing a spare allocation when there is one.
+    pub(super) fn take_items() -> Vec<FlexItem> {
+        ITEMS.with(|pool| pool.borrow_mut().pop()).unwrap_or_default()
+    }
+
+    /// Returns an item list for reuse.
+    pub(super) fn give_items(mut items: Vec<FlexItem>) {
+        items.clear();
+        ITEMS.with(|pool| give(pool, items));
+    }
+
+    /// An empty line list, reusing a spare allocation when there is one.
+    pub(super) fn take_lines<'a>() -> Vec<FlexLine<'a>> {
+        LINES.with(|pool| pool.borrow_mut().pop()).map(recycle).unwrap_or_default()
+    }
+
+    /// Returns a line list for reuse.
+    pub(super) fn give_lines(lines: Vec<FlexLine<'_>>) {
+        LINES.with(|pool| give(pool, recycle(lines)));
+    }
+}
+
+#[cfg(not(feature = "std"))]
+/// Without `std` there is no thread-local pool, so every pass allocates as before.
+mod scratch {
+    use super::{FlexItem, FlexLine};
+    use crate::util::sys::Vec;
+
+    /// A new item list.
+    pub(super) fn take_items() -> Vec<FlexItem> {
+        Vec::new()
+    }
+    /// Drops the item list.
+    pub(super) fn give_items(_: Vec<FlexItem>) {}
+    /// A new line list.
+    pub(super) fn take_lines<'a>() -> Vec<FlexLine<'a>> {
+        Vec::new()
+    }
+    /// Drops the line list.
+    pub(super) fn give_lines(_: Vec<FlexLine<'_>>) {}
+}
+
+/// Returns the item list to the pool when the pass ends, early returns included.
+struct PooledItems(Vec<FlexItem>);
+
+impl core::ops::Deref for PooledItems {
+    type Target = Vec<FlexItem>;
+    fn deref(&self) -> &Vec<FlexItem> {
+        &self.0
+    }
+}
+
+impl core::ops::DerefMut for PooledItems {
+    fn deref_mut(&mut self) -> &mut Vec<FlexItem> {
+        &mut self.0
+    }
+}
+
+impl Drop for PooledItems {
+    fn drop(&mut self) {
+        scratch::give_items(core::mem::take(&mut self.0));
+    }
+}
+
+/// Returns the line list to the pool; declared after the items it borrows, so it drops first.
+struct PooledLines<'a>(Vec<FlexLine<'a>>);
+
+impl<'a> core::ops::Deref for PooledLines<'a> {
+    type Target = Vec<FlexLine<'a>>;
+    fn deref(&self) -> &Vec<FlexLine<'a>> {
+        &self.0
+    }
+}
+
+impl<'a> core::ops::DerefMut for PooledLines<'a> {
+    fn deref_mut(&mut self) -> &mut Vec<FlexLine<'a>> {
+        &mut self.0
+    }
+}
+
+impl<'b, 'a> IntoIterator for &'b mut PooledLines<'a> {
+    type Item = &'b mut FlexLine<'a>;
+    type IntoIter = core::slice::IterMut<'b, FlexLine<'a>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter_mut()
+    }
+}
+
+impl<'b, 'a> IntoIterator for &'b PooledLines<'a> {
+    type Item = &'b FlexLine<'a>;
+    type IntoIter = core::slice::Iter<'b, FlexLine<'a>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl Drop for PooledLines<'_> {
+    fn drop(&mut self) {
+        scratch::give_lines(core::mem::take(&mut self.0));
+    }
+}
+
 /// A line of [`FlexItem`] used for intermediate computation
 struct FlexLine<'a> {
     /// The slice of items to iterate over during computation of this line
@@ -372,7 +505,7 @@ fn compute_preliminary(tree: &mut impl LayoutFlexboxContainer, node: NodeId, inp
 
     // 1. Generate anonymous flex items as described in §4 Flex Items.
     debug_log!("generate_anonymous_flex_items");
-    let mut flex_items = generate_anonymous_flex_items(tree, node, &constants);
+    let mut flex_items = PooledItems(generate_anonymous_flex_items(tree, node, &constants));
 
     // 9.2. Line Length Determination
 
@@ -401,13 +534,13 @@ fn compute_preliminary(tree: &mut impl LayoutFlexboxContainer, node: NodeId, inp
     // 5. Collect flex items into flex lines.
     debug_log!("collect_flex_lines");
     #[cfg(feature = "flexbox_balance")]
-    let mut flex_lines = if constants.is_balance {
+    let mut flex_lines = PooledLines(if constants.is_balance {
         collect_balanced_flex_lines(&constants, available_space, &mut flex_items)
     } else {
         collect_flex_lines(&constants, available_space, &mut flex_items)
-    };
+    });
     #[cfg(not(feature = "flexbox_balance"))]
-    let mut flex_lines = collect_flex_lines(&constants, available_space, &mut flex_items);
+    let mut flex_lines = PooledLines(collect_flex_lines(&constants, available_space, &mut flex_items));
 
     // If container size is undefined, determine the container's main size
     // and then re-resolve gaps based on newly determined size
@@ -800,7 +933,7 @@ fn generate_anonymous_flex_items(
 
     // Allocate once, for the child count, when the first item is generated (some children may not generate one)
     let child_count = tree.child_count(node);
-    let mut flex_items = Vec::new();
+    let mut flex_items = scratch::take_items();
     tree.child_ids(node)
         .enumerate()
         .map(|(index, child)| (index, child, tree.get_flexbox_child_style(child)))
@@ -881,8 +1014,8 @@ fn generate_anonymous_flex_items(
             }
         })
         .for_each(|item| {
-            if flex_items.capacity() == 0 {
-                flex_items = new_vec_with_capacity(child_count);
+            if flex_items.is_empty() {
+                flex_items.reserve(child_count);
             }
             flex_items.push(item);
         });
@@ -1251,7 +1384,7 @@ fn collect_flex_lines<'a>(
     // is derived from its own content (and is thus indefinite) then all items are collected into a
     // single flex line, matching how the container was sized under a min/max-content constraint.
     if !constants.is_wrap || !constants.known_main_size_is_definite {
-        let mut lines = new_vec_with_capacity(1);
+        let mut lines = scratch::take_lines();
         lines.push(FlexLine { items: flex_items.as_mut_slice(), cross_size: 0.0, offset_cross: 0.0 });
         lines
     } else {
@@ -1279,7 +1412,7 @@ fn collect_flex_lines<'a>(
             // If we're sizing under a max-content constraint then the flex items will never wrap
             // (at least for now - future extensions to the CSS spec may add provisions for forced wrap points)
             AvailableSpace::MaxContent => {
-                let mut lines = new_vec_with_capacity(1);
+                let mut lines = scratch::take_lines();
                 lines.push(FlexLine { items: flex_items.as_mut_slice(), cross_size: 0.0, offset_cross: 0.0 });
                 lines
             }
@@ -1296,7 +1429,7 @@ fn collect_flex_lines<'a>(
                 lines
             }
             AvailableSpace::Definite(main_axis_available_space) => {
-                let mut lines = new_vec_with_capacity(1);
+                let mut lines = scratch::take_lines();
                 let mut flex_items = &mut flex_items[..];
                 let main_axis_gap = constants.gap.main(constants.dir);
 
