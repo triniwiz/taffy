@@ -131,6 +131,156 @@ impl FlexItem {
     }
 }
 
+/// Spare vectors reused across flexbox passes instead of allocating per container. They are used
+/// as stacks, so nested containers each take their own.
+#[cfg(feature = "std")]
+mod scratch {
+    use super::{FlexItem, FlexLine};
+    use std::cell::RefCell;
+    use std::vec::Vec;
+
+    /// Spare vectors kept per kind; deeper nesting than this allocates as before.
+    const MAX_POOLED: usize = 64;
+
+    std::thread_local! {
+        static ITEMS: RefCell<Vec<Vec<FlexItem>>> = const { RefCell::new(Vec::new()) };
+        static LINES: RefCell<Vec<Vec<FlexLine<'static>>>> = const { RefCell::new(Vec::new()) };
+        static UNFROZEN: RefCell<Vec<Vec<&'static mut FlexItem>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Re-types an emptied vector. In-place collection keeps the allocation, since the element
+    /// types differ only in lifetime.
+    fn recycle<T, U>(mut v: Vec<T>) -> Vec<U> {
+        v.clear();
+        v.into_iter().map(|_| unreachable!()).collect()
+    }
+
+    /// Returns an emptied vector to `pool` unless it is full.
+    fn give<T>(pool: &RefCell<Vec<Vec<T>>>, v: Vec<T>) {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < MAX_POOLED {
+            pool.push(v);
+        }
+    }
+
+    /// An empty item list, reusing a spare allocation when there is one.
+    pub(super) fn take_items() -> Vec<FlexItem> {
+        ITEMS.with(|pool| pool.borrow_mut().pop()).unwrap_or_default()
+    }
+
+    /// Returns an item list for reuse.
+    pub(super) fn give_items(mut items: Vec<FlexItem>) {
+        items.clear();
+        ITEMS.with(|pool| give(pool, items));
+    }
+
+    /// An empty line list, reusing a spare allocation when there is one.
+    pub(super) fn take_lines<'a>() -> Vec<FlexLine<'a>> {
+        LINES.with(|pool| pool.borrow_mut().pop()).map(recycle).unwrap_or_default()
+    }
+
+    /// Returns a line list for reuse.
+    pub(super) fn give_lines(lines: Vec<FlexLine<'_>>) {
+        LINES.with(|pool| give(pool, recycle(lines)));
+    }
+
+    /// An empty list for a line's unfrozen items, reusing a spare allocation when there is one.
+    pub(super) fn take_unfrozen<'a>() -> Vec<&'a mut FlexItem> {
+        UNFROZEN.with(|pool| pool.borrow_mut().pop()).map(recycle).unwrap_or_default()
+    }
+
+    /// Returns an unfrozen-item list for reuse.
+    pub(super) fn give_unfrozen(items: Vec<&mut FlexItem>) {
+        UNFROZEN.with(|pool| give(pool, recycle(items)));
+    }
+}
+
+#[cfg(not(feature = "std"))]
+/// Without `std` there is no thread-local pool, so every pass allocates as before.
+mod scratch {
+    use super::{FlexItem, FlexLine};
+    use crate::util::sys::Vec;
+
+    /// A new item list.
+    pub(super) fn take_items() -> Vec<FlexItem> {
+        Vec::new()
+    }
+    /// Drops the item list.
+    pub(super) fn give_items(_: Vec<FlexItem>) {}
+    /// A new line list.
+    pub(super) fn take_lines<'a>() -> Vec<FlexLine<'a>> {
+        Vec::new()
+    }
+    /// Drops the line list.
+    pub(super) fn give_lines(_: Vec<FlexLine<'_>>) {}
+    /// A new list for a line's unfrozen items.
+    pub(super) fn take_unfrozen<'a>() -> Vec<&'a mut FlexItem> {
+        Vec::new()
+    }
+    /// Drops the unfrozen-item list.
+    pub(super) fn give_unfrozen(_: Vec<&mut FlexItem>) {}
+}
+
+/// Returns the item list to the pool when the pass ends, early returns included.
+struct PooledItems(Vec<FlexItem>);
+
+impl core::ops::Deref for PooledItems {
+    type Target = Vec<FlexItem>;
+    fn deref(&self) -> &Vec<FlexItem> {
+        &self.0
+    }
+}
+
+impl core::ops::DerefMut for PooledItems {
+    fn deref_mut(&mut self) -> &mut Vec<FlexItem> {
+        &mut self.0
+    }
+}
+
+impl Drop for PooledItems {
+    fn drop(&mut self) {
+        scratch::give_items(core::mem::take(&mut self.0));
+    }
+}
+
+/// Returns the line list to the pool; declared after the items it borrows, so it drops first.
+struct PooledLines<'a>(Vec<FlexLine<'a>>);
+
+impl<'a> core::ops::Deref for PooledLines<'a> {
+    type Target = Vec<FlexLine<'a>>;
+    fn deref(&self) -> &Vec<FlexLine<'a>> {
+        &self.0
+    }
+}
+
+impl<'a> core::ops::DerefMut for PooledLines<'a> {
+    fn deref_mut(&mut self) -> &mut Vec<FlexLine<'a>> {
+        &mut self.0
+    }
+}
+
+impl<'b, 'a> IntoIterator for &'b mut PooledLines<'a> {
+    type Item = &'b mut FlexLine<'a>;
+    type IntoIter = core::slice::IterMut<'b, FlexLine<'a>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter_mut()
+    }
+}
+
+impl<'b, 'a> IntoIterator for &'b PooledLines<'a> {
+    type Item = &'b FlexLine<'a>;
+    type IntoIter = core::slice::Iter<'b, FlexLine<'a>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl Drop for PooledLines<'_> {
+    fn drop(&mut self) {
+        scratch::give_lines(core::mem::take(&mut self.0));
+    }
+}
+
 /// A line of [`FlexItem`] used for intermediate computation
 struct FlexLine<'a> {
     /// The slice of items to iterate over during computation of this line
@@ -345,7 +495,7 @@ fn compute_preliminary(tree: &mut impl LayoutFlexboxContainer, node: NodeId, inp
 
     // 1. Generate anonymous flex items as described in §4 Flex Items.
     debug_log!("generate_anonymous_flex_items");
-    let mut flex_items = generate_anonymous_flex_items(tree, node, &constants);
+    let mut flex_items = PooledItems(generate_anonymous_flex_items(tree, node, &constants));
 
     // 9.2. Line Length Determination
 
@@ -374,13 +524,13 @@ fn compute_preliminary(tree: &mut impl LayoutFlexboxContainer, node: NodeId, inp
     // 5. Collect flex items into flex lines.
     debug_log!("collect_flex_lines");
     #[cfg(feature = "flexbox_balance")]
-    let mut flex_lines = if constants.is_balance {
+    let mut flex_lines = PooledLines(if constants.is_balance {
         collect_balanced_flex_lines(&constants, available_space, &mut flex_items)
     } else {
         collect_flex_lines(&constants, available_space, &mut flex_items)
-    };
+    });
     #[cfg(not(feature = "flexbox_balance"))]
-    let mut flex_lines = collect_flex_lines(&constants, available_space, &mut flex_items);
+    let mut flex_lines = PooledLines(collect_flex_lines(&constants, available_space, &mut flex_items));
 
     // If container size is undefined, determine the container's main size
     // and then re-resolve gaps based on newly determined size
@@ -743,88 +893,95 @@ fn generate_anonymous_flex_items(
         constants.node_inner_size.with_main(constants.dir, None)
     };
 
-    tree.child_ids(node)
-        .enumerate()
-        .map(|(index, child)| (index, child, tree.get_flexbox_child_style(child)))
-        .filter(|(_, _, style)| !style.position().is_out_of_flow())
-        .filter(|(_, _, style)| style.box_generation_mode() != BoxGenerationMode::None)
-        .map(|(index, child, child_style)| {
-            let aspect_ratio = child_style.aspect_ratio();
-            let padding = child_style
-                .padding()
-                .resolve_or_zero(constants.node_inner_size.width, |val, basis| tree.calc(val, basis));
-            let border = child_style
-                .border()
-                .resolve_or_zero(constants.node_inner_size.width, |val, basis| tree.calc(val, basis));
-            let pb_sum = (padding + border).sum_axes();
-            let box_sizing_adjustment =
-                if child_style.box_sizing() == BoxSizing::ContentBox { pb_sum } else { Size::ZERO };
-            FlexItem {
-                node: child,
-                order: index as u32,
-                size: child_style
-                    .size()
-                    .maybe_resolve(percent_resolution_size, |val, basis| tree.calc(val, basis))
-                    .maybe_apply_aspect_ratio(aspect_ratio)
-                    .maybe_add(box_sizing_adjustment),
-                size_style: child_style.size(),
-                min_size: child_style
-                    .min_size()
-                    .maybe_resolve(percent_resolution_size, |val, basis| tree.calc(val, basis))
-                    .maybe_add(box_sizing_adjustment),
-                max_size: child_style
-                    .max_size()
-                    .maybe_resolve(percent_resolution_size, |val, basis| tree.calc(val, basis))
-                    .maybe_add(box_sizing_adjustment),
-                aspect_ratio,
-
-                relative_inset: if child_style.position() == Position::Relative {
-                    let inset = child_style.inset().zip_size(constants.node_inner_size, |p, s| {
-                        p.maybe_resolve(s, |val, basis| tree.calc(val, basis))
-                    });
-                    resolve_relative_inset(inset, constants)
-                } else {
-                    Size::ZERO
-                },
-                margin: child_style
-                    .margin()
-                    .resolve_or_zero(constants.node_inner_size.width, |val, basis| tree.calc(val, basis)),
-                margin_is_auto: child_style.margin().map(LengthPercentageAuto::is_auto),
-                padding: child_style
+    let mut items = scratch::take_items();
+    items.extend(
+        tree.child_ids(node)
+            .enumerate()
+            .map(|(index, child)| (index, child, tree.get_flexbox_child_style(child)))
+            .filter(|(_, _, style)| !style.position().is_out_of_flow())
+            .filter(|(_, _, style)| style.box_generation_mode() != BoxGenerationMode::None)
+            .map(|(index, child, child_style)| {
+                let aspect_ratio = child_style.aspect_ratio();
+                let padding = child_style
                     .padding()
-                    .resolve_or_zero(constants.node_inner_size.width, |val, basis| tree.calc(val, basis)),
-                border: child_style
+                    .resolve_or_zero(constants.node_inner_size.width, |val, basis| tree.calc(val, basis));
+                let border = child_style
                     .border()
-                    .resolve_or_zero(constants.node_inner_size.width, |val, basis| tree.calc(val, basis)),
-                align_self: resolve_normal_alignment(child_style.align_self().unwrap_or(constants.align_items))
-                    .resolve_self_relative(child_style.direction(), constants.layout_direction, constants.is_column),
-                overflow: child_style.overflow(),
-                contain: child_style.contain(),
-                scrollbar_width: child_style.scrollbar_width(),
-                flex_grow: child_style.flex_grow(),
-                flex_shrink: child_style.flex_shrink(),
-                flex_basis_is_definite: false,
-                flex_basis: 0.0,
-                inner_flex_basis: 0.0,
-                violation: 0.0,
-                frozen: false,
+                    .resolve_or_zero(constants.node_inner_size.width, |val, basis| tree.calc(val, basis));
+                let pb_sum = (padding + border).sum_axes();
+                let box_sizing_adjustment =
+                    if child_style.box_sizing() == BoxSizing::ContentBox { pb_sum } else { Size::ZERO };
+                FlexItem {
+                    node: child,
+                    order: index as u32,
+                    size: child_style
+                        .size()
+                        .maybe_resolve(percent_resolution_size, |val, basis| tree.calc(val, basis))
+                        .maybe_apply_aspect_ratio(aspect_ratio)
+                        .maybe_add(box_sizing_adjustment),
+                    size_style: child_style.size(),
+                    min_size: child_style
+                        .min_size()
+                        .maybe_resolve(percent_resolution_size, |val, basis| tree.calc(val, basis))
+                        .maybe_add(box_sizing_adjustment),
+                    max_size: child_style
+                        .max_size()
+                        .maybe_resolve(percent_resolution_size, |val, basis| tree.calc(val, basis))
+                        .maybe_add(box_sizing_adjustment),
+                    aspect_ratio,
 
-                resolved_minimum_main_size: 0.0,
-                hypothetical_inner_size: Size::zero(),
-                hypothetical_outer_size: Size::zero(),
-                target_size: Size::zero(),
-                outer_target_size: Size::zero(),
-                content_flex_fraction: 0.0,
+                    relative_inset: if child_style.position() == Position::Relative {
+                        let inset = child_style.inset().zip_size(constants.node_inner_size, |p, s| {
+                            p.maybe_resolve(s, |val, basis| tree.calc(val, basis))
+                        });
+                        resolve_relative_inset(inset, constants)
+                    } else {
+                        Size::ZERO
+                    },
+                    margin: child_style
+                        .margin()
+                        .resolve_or_zero(constants.node_inner_size.width, |val, basis| tree.calc(val, basis)),
+                    margin_is_auto: child_style.margin().map(LengthPercentageAuto::is_auto),
+                    padding: child_style
+                        .padding()
+                        .resolve_or_zero(constants.node_inner_size.width, |val, basis| tree.calc(val, basis)),
+                    border: child_style
+                        .border()
+                        .resolve_or_zero(constants.node_inner_size.width, |val, basis| tree.calc(val, basis)),
+                    align_self: resolve_normal_alignment(child_style.align_self().unwrap_or(constants.align_items))
+                        .resolve_self_relative(
+                            child_style.direction(),
+                            constants.layout_direction,
+                            constants.is_column,
+                        ),
+                    overflow: child_style.overflow(),
+                    contain: child_style.contain(),
+                    scrollbar_width: child_style.scrollbar_width(),
+                    flex_grow: child_style.flex_grow(),
+                    flex_shrink: child_style.flex_shrink(),
+                    flex_basis_is_definite: false,
+                    flex_basis: 0.0,
+                    inner_flex_basis: 0.0,
+                    violation: 0.0,
+                    frozen: false,
 
-                baseline: 0.0,
+                    resolved_minimum_main_size: 0.0,
+                    hypothetical_inner_size: Size::zero(),
+                    hypothetical_outer_size: Size::zero(),
+                    target_size: Size::zero(),
+                    outer_target_size: Size::zero(),
+                    content_flex_fraction: 0.0,
 
-                offset_main: 0.0,
-                offset_cross: 0.0,
+                    baseline: 0.0,
 
-                oof_candidates: OofCandidates::NONE,
-            }
-        })
-        .collect()
+                    offset_main: 0.0,
+                    offset_cross: 0.0,
+
+                    oof_candidates: OofCandidates::NONE,
+                }
+            }),
+    );
+    items
 }
 
 /// Determine the available main and cross space for the flex items.
@@ -1198,7 +1355,7 @@ fn collect_flex_lines<'a>(
     // is derived from its own content (and is thus indefinite) then all items are collected into a
     // single flex line, matching how the container was sized under a min/max-content constraint.
     if !constants.is_wrap || !constants.known_main_size_is_definite {
-        let mut lines = new_vec_with_capacity(1);
+        let mut lines = scratch::take_lines();
         lines.push(FlexLine { items: flex_items.as_mut_slice(), cross_size: 0.0, offset_cross: 0.0 });
         lines
     } else {
@@ -1226,7 +1383,7 @@ fn collect_flex_lines<'a>(
             // If we're sizing under a max-content constraint then the flex items will never wrap
             // (at least for now - future extensions to the CSS spec may add provisions for forced wrap points)
             AvailableSpace::MaxContent => {
-                let mut lines = new_vec_with_capacity(1);
+                let mut lines = scratch::take_lines();
                 lines.push(FlexLine { items: flex_items.as_mut_slice(), cross_size: 0.0, offset_cross: 0.0 });
                 lines
             }
@@ -1243,7 +1400,7 @@ fn collect_flex_lines<'a>(
                 lines
             }
             AvailableSpace::Definite(main_axis_available_space) => {
-                let mut lines = new_vec_with_capacity(1);
+                let mut lines = scratch::take_lines();
                 let mut flex_items = &mut flex_items[..];
                 let main_axis_gap = constants.gap.main(constants.dir);
 
@@ -1822,7 +1979,8 @@ fn resolve_flexible_lengths(line: &mut FlexLine, constants: &AlgoConstants) {
                 })
                 .sum::<f32>();
 
-        let mut unfrozen: Vec<&mut FlexItem> = line.items.iter_mut().filter(|child| !child.frozen).collect();
+        let mut unfrozen: Vec<&mut FlexItem> = scratch::take_unfrozen();
+        unfrozen.extend(line.items.iter_mut().filter(|child| !child.frozen));
 
         let (sum_flex_grow, sum_flex_shrink): (f32, f32) =
             unfrozen.iter().fold((0.0, 0.0), |(flex_grow, flex_shrink), item| {
@@ -1917,6 +2075,7 @@ fn resolve_flexible_lengths(line: &mut FlexLine, constants: &AlgoConstants) {
                 _ => child.frozen = true,
             }
         }
+        scratch::give_unfrozen(unfrozen);
 
         // f. Return to the start of this loop.
     }
